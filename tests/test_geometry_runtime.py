@@ -18,8 +18,11 @@ from any4d.training.geometry_runtime import (
     export_inference_checkpoint,
     file_sha256,
     flow_cache_digest,
+    info_sharing_block_prefixes,
+    legacy_flow_digest,
     load_geometry_state_dict,
     load_resume_checkpoint,
+    migrate_checkpoint_flow_digest,
     prepare_model_inputs,
     run_geometry_training,
     save_best_checkpoint,
@@ -163,6 +166,7 @@ class FakeAmuseModel(nn.Module):
         self.dpt_feature_head = nn.Linear(4, 4)
         self.scene_flow_dpt_regressor_head = ConvBlock()
         self.scene_flow_dpt_feature_head = nn.Linear(4, 4)
+        self.info_sharing = nn.ModuleList([nn.Linear(4, 4) for _ in range(3)])
         self.to(dtype)
 
 
@@ -213,6 +217,50 @@ class AmuseWiringTest(unittest.TestCase):
         self.assertIn("pose_head.fc_rot.weight", aux_names)
         self.assertIn("scale_head.output_proj.weight", aux_names)
         self.assertTrue(AMUSE_OUTPUT_PREFIXES)
+
+    def test_info_sharing_block_prefixes(self):
+        model = FakeAmuseModel()
+        self.assertEqual(
+            info_sharing_block_prefixes(model, 2),
+            ("info_sharing.1.", "info_sharing.2."),
+        )
+        with self.assertRaises(ValueError):
+            info_sharing_block_prefixes(model, 4)
+
+    def test_amuse_low_lr_groups(self):
+        model = FakeAmuseModel(dtype=torch.float64)
+        names = set_trainable_geometry_heads(
+            model, prefixes=TRAINABLE_PREFIXES + ("info_sharing.2.",)
+        )
+        optimizer, manifest = build_amuse(
+            model,
+            names,
+            warmup_steps=2,
+            low_lr_prefixes=("info_sharing.2.",),
+            low_lr_muon_lr=1e-5,
+            low_lr_aux_lr=1e-6,
+        )
+        covered = [id(p) for g in optimizer.param_groups for p in g["params"]]
+        self.assertEqual(len(covered), len(set(covered)))
+        self.assertEqual(len(covered), len(names))
+        low_muon = [
+            g
+            for g in manifest["groups"]
+            if g["update_type"] == "muon" and abs(g["lr"] - 1e-5) < 1e-12
+        ]
+        low_aux = [
+            g
+            for g in manifest["groups"]
+            if g["update_type"] == "adamw" and abs(g["lr"] - 1e-6) < 1e-12
+        ]
+        self.assertEqual(len(low_muon), 1)
+        self.assertEqual(len(low_aux), 1)
+        self.assertTrue(
+            any(p["name"] == "info_sharing.2.weight" for p in low_muon[0]["params"])
+        )
+        self.assertTrue(
+            any(p["name"] == "info_sharing.2.bias" for p in low_aux[0]["params"])
+        )
 
     def test_amuse_x_y_roundtrip(self):
         optimizer, _ = build_amuse(self.model, self.names, warmup_steps=2)
@@ -325,9 +373,10 @@ class CheckpointRoundTripTest(unittest.TestCase):
 
         resumed_model = FakeAmuseModel(dtype=torch.float64)
         resumed_model.load_state_dict(self.model.state_dict())
-        for name, parameter in resumed_model.named_parameters():
-            parameter.data.copy_(torch.randn_like(parameter))
         resumed_names = set_trainable_geometry_heads(resumed_model)
+        for name, parameter in resumed_model.named_parameters():
+            if parameter.requires_grad:
+                parameter.data.copy_(torch.randn_like(parameter))
         resumed_optimizer, resumed_manifest = build_amuse(
             resumed_model, resumed_names, warmup_steps=2
         )
@@ -386,6 +435,7 @@ class CheckpointRoundTripTest(unittest.TestCase):
 
     def test_export_strict_roundtrip(self):
         base = FakeAmuseModel(dtype=torch.float64)
+        base.load_state_dict(self.model.state_dict())
         base_path = self._path("base.pt")
         torch.save({"model": base.state_dict()}, base_path)
         self.contract["base_sha256"] = file_sha256(base_path)
@@ -489,15 +539,28 @@ class CheckpointRoundTripTest(unittest.TestCase):
         )
         self.optimizer.train()
         payload = torch.load(best_path, map_location="cpu", weights_only=False)
-        payload.pop("base_sha256")
-        payload.pop("objective_id")
-        stripped = self._path("best_stripped.pt")
-        torch.save(payload, stripped)
-        with self.assertRaises(ValueError):
+
+        without_objective = dict(payload)
+        without_objective.pop("objective_id")
+        stripped_objective = self._path("best_no_objective.pt")
+        torch.save(without_objective, stripped_objective)
+        with self.assertRaisesRegex(ValueError, "objective_id"):
             export_inference_checkpoint(
                 base_path,
-                stripped,
-                self._path("export.pt"),
+                stripped_objective,
+                self._path("export_no_objective.pt"),
+                model_factory=lambda: FakeAmuseModel(dtype=torch.float64),
+            )
+
+        without_base = dict(payload)
+        without_base.pop("base_sha256")
+        stripped_base = self._path("best_no_base.pt")
+        torch.save(without_base, stripped_base)
+        with self.assertRaisesRegex(ValueError, "base_sha256"):
+            export_inference_checkpoint(
+                base_path,
+                stripped_base,
+                self._path("export_no_base.pt"),
                 model_factory=lambda: FakeAmuseModel(dtype=torch.float64),
             )
 
@@ -698,6 +761,34 @@ class TrainingLoopTest(unittest.TestCase):
         for row in step_rows:
             self.assertTrue(torch.isfinite(torch.tensor(row["loss"])))
 
+    def test_train_loop_with_unfreeze_block(self):
+        output = os.path.join(self.tmp.name, "run-unfreeze")
+        config = self._config(output)
+        config["unfreeze_blocks"] = 1
+        config["max_updates"] = 2
+        summary = run_geometry_training(
+            config,
+            model=FakeTrainableModel(dtype=torch.float32),
+            train_dataset=TinyGeometryDataset(length=2),
+            eval_dataset=TinyGeometryDataset(length=1),
+            device="cpu",
+            dataset_digest="test-digest",
+            base_sha256="test-base",
+        )
+        self.assertGreater(summary["trainable_count"], 0)
+        with open(
+            os.path.join(output, "trainable_manifest.json"), encoding="utf-8"
+        ) as stream:
+            manifest = json.load(stream)["manifest"]
+        names = [
+            entry["name"]
+            for group in manifest["groups"]
+            for entry in group["params"]
+        ]
+        self.assertTrue(any(name.startswith("info_sharing.") for name in names))
+        levels = {round(group["lr"], 8) for group in manifest["groups"]}
+        self.assertIn(round(1e-4 / 3, 8), levels)
+
     def test_trainer_propagates_epoch_to_dataset(self):
         output = os.path.join(self.tmp.name, "run-epochs")
         dataset = RecordingDataset(length=2)
@@ -768,6 +859,16 @@ class TrainingLoopTest(unittest.TestCase):
                 "bf16",
                 "--optimizer",
                 "amuse",
+                "--muon-lr",
+                "3e-5",
+                "--aux-lr",
+                "3e-6",
+                "--unfreeze-blocks",
+                "2",
+                "--unfrozen-muon-lr",
+                "1e-5",
+                "--unfrozen-aux-lr",
+                "1e-6",
                 "--objective",
                 "any4d_factorized_pseudo_sf_v2",
                 "--seed",
@@ -777,6 +878,11 @@ class TrainingLoopTest(unittest.TestCase):
         config = cli.args_to_config(args)
         validate_training_config(config)
         self.assertEqual(config["train_split"], "smoke")
+        self.assertAlmostEqual(config["muon_lr"], 3e-5)
+        self.assertAlmostEqual(config["aux_lr"], 3e-6)
+        self.assertEqual(config["unfreeze_blocks"], 2)
+        self.assertAlmostEqual(config["unfrozen_muon_lr"], 1e-5)
+        self.assertAlmostEqual(config["unfrozen_aux_lr"], 1e-6)
 
         bad = parser.parse_args(
             [
@@ -954,6 +1060,71 @@ class FlowDigestTest(unittest.TestCase):
         second = flow_cache_digest(root)
         self.assertNotEqual(first, second)
         self.assertEqual(second, flow_cache_digest(root))
+
+
+class FlowDigestMigrationTest(unittest.TestCase):
+    def _cache(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        os.makedirs(os.path.join(root, "train"))
+        np.savez(
+            os.path.join(root, "train", "pair.npz"),
+            flow_m=np.zeros((2, 3), dtype=np.float32),
+        )
+        with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "completed": True,
+                    "dataset_digest": "ds",
+                    "pose_convention": "stored_extrinsics_are_w2c",
+                    "teacher": {"name": "t", "sha256": "s"},
+                },
+                stream,
+            )
+        with open(
+            os.path.join(root, "flow_quality.json"), "w", encoding="utf-8"
+        ) as stream:
+            json.dump({"train": {}}, stream)
+        return root
+
+    def test_migrate_updates_digest_and_contract(self):
+        root = self._cache()
+        legacy = legacy_flow_digest(root)
+        checkpoint_path = os.path.join(root, "last.pt")
+        torch.save(
+            {
+                "schema_version": 1,
+                "mode": "train_y",
+                "flow_digest": legacy,
+                "dataset_digest": "ds",
+                "resolved_config": {"contract": {"flow_digest": legacy}},
+            },
+            checkpoint_path,
+        )
+        new_digest = migrate_checkpoint_flow_digest(checkpoint_path, root)
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self.assertEqual(payload["flow_digest"], new_digest)
+        self.assertEqual(
+            payload["resolved_config"]["contract"]["flow_digest"], new_digest
+        )
+        self.assertNotEqual(new_digest, legacy)
+        self.assertTrue(os.path.isfile(checkpoint_path + ".pre_migration"))
+
+    def test_migrate_rejects_mismatched_digest(self):
+        root = self._cache()
+        checkpoint_path = os.path.join(root, "last.pt")
+        torch.save(
+            {
+                "schema_version": 1,
+                "mode": "train_y",
+                "flow_digest": "wrong-digest",
+                "dataset_digest": "ds",
+            },
+            checkpoint_path,
+        )
+        with self.assertRaisesRegex(ValueError, "refusing to migrate"):
+            migrate_checkpoint_flow_digest(checkpoint_path, root)
 
 
 class FlowOffsetModel(FakeAmuseModel):

@@ -65,6 +65,14 @@ def build_parser():
     prepare.add_argument("--max-pairs", type=int, default=None)
     prepare.add_argument("--resume", action="store_true")
 
+    migrate = subparsers.add_parser(
+        "migrate-flow-digest",
+        help="migrate a stored legacy flow_digest to the content digest",
+    )
+    migrate.add_argument("--checkpoint", required=True)
+    migrate.add_argument("--flow-root", required=True)
+    migrate.add_argument("--output", default=None)
+
     train = subparsers.add_parser("train", help="run head-only geometry training")
     train.add_argument("--data-root", required=True)
     train.add_argument("--base-checkpoint", required=True)
@@ -83,6 +91,11 @@ def build_parser():
     train.add_argument("--batch-size", type=int, default=1)
     train.add_argument("--precision", default="bf16")
     train.add_argument("--optimizer", default="amuse")
+    train.add_argument("--muon-lr", type=float, default=1e-4)
+    train.add_argument("--aux-lr", type=float, default=1e-5)
+    train.add_argument("--unfreeze-blocks", type=int, default=0)
+    train.add_argument("--unfrozen-muon-lr", type=float, default=None)
+    train.add_argument("--unfrozen-aux-lr", type=float, default=None)
     train.add_argument("--seed", type=int, default=42)
     train.add_argument("--resume", default=None)
     train.add_argument("--config-dir", default=DEFAULT_CONFIG_DIR)
@@ -127,10 +140,24 @@ def args_to_config(args):
         "batch_size": args.batch_size,
         "precision": args.precision,
         "optimizer": args.optimizer,
+        "muon_lr": args.muon_lr,
+        "aux_lr": args.aux_lr,
+        "unfreeze_blocks": args.unfreeze_blocks,
+        "unfrozen_muon_lr": args.unfrozen_muon_lr,
+        "unfrozen_aux_lr": args.unfrozen_aux_lr,
         "seed": args.seed,
         "resume": args.resume,
         "config_dir": args.config_dir,
     }
+
+
+def run_migrate_flow_digest(config):
+    from any4d.training.geometry_runtime import migrate_checkpoint_flow_digest
+
+    digest = migrate_checkpoint_flow_digest(
+        config["checkpoint"], config["flow_root"], config["output"]
+    )
+    return {"flow_digest": digest, "checkpoint": config["output"] or config["checkpoint"]}
 
 
 def run_check_data(data_root):
@@ -375,6 +402,16 @@ def main(argv=None):
             return 0
         if args.command == "train":
             run_train(args_to_config(args))
+            return 0
+        if args.command == "migrate-flow-digest":
+            report = run_migrate_flow_digest(
+                {
+                    "checkpoint": args.checkpoint,
+                    "flow_root": args.flow_root,
+                    "output": args.output,
+                }
+            )
+            print(json.dumps(report, indent=2))
             return 0
         if args.command == "eval":
             run_eval(

@@ -596,7 +596,7 @@ class FlowCacheContractTest(unittest.TestCase):
 
     def test_flow_cache_digest_mismatch_rejected(self):
         self._write_cache_for_all({})
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "different dataset digest"):
             GeometryDataset(
                 DATA_ROOT,
                 "train",
@@ -612,7 +612,7 @@ class FlowCacheContractTest(unittest.TestCase):
         manifest["pose_convention"] = "stored_extrinsics_are_c2w"
         with open(manifest_path, "w", encoding="utf-8") as stream:
             json.dump(manifest, stream)
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "pose convention mismatch"):
             GeometryDataset(
                 DATA_ROOT,
                 "train",

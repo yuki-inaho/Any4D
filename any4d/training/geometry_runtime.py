@@ -13,6 +13,7 @@ import time
 
 import numpy as np
 import torch
+from torch import nn
 
 from any4d.models import init_model
 from any4d.training.geometry_data import (
@@ -70,6 +71,34 @@ FORBIDDEN_MODEL_INPUT_KEYS = {
     "valid_mask",
     "holdout_mask",
 }
+
+
+def info_sharing_block_prefixes(model, count):
+    """Name prefixes of the last ``count`` info-sharing transformer blocks."""
+    module = getattr(model, "info_sharing", None)
+    if module is None:
+        raise ValueError("model has no info_sharing module to unfreeze")
+    if int(count) <= 0:
+        raise ValueError("count must be positive")
+    candidates = []
+    if isinstance(module, (nn.ModuleList, nn.Sequential)):
+        candidates.append(("", module))
+    else:
+        for name, child in module.named_children():
+            if isinstance(child, (nn.ModuleList, nn.Sequential)):
+                candidates.append((name, child))
+    for name, child in candidates:
+        length = len(child)
+        if int(count) > length:
+            raise ValueError(
+                f"cannot unfreeze {count} blocks from a {length}-block module"
+            )
+        start = length - int(count)
+        parts = ["info_sharing"] + ([name] if name else [])
+        return tuple(
+            ".".join(parts + [str(index)]) + "." for index in range(start, length)
+        )
+    raise ValueError("no indexed transformer block list found in info_sharing")
 
 
 def set_trainable_geometry_heads(model, prefixes=TRAINABLE_PREFIXES):
@@ -166,6 +195,7 @@ def build_geometry_model(
     device="cpu",
     machine="local",
     task="rgbd",
+    unfreeze_blocks=0,
 ):
     """Build Any4D from the repo config and load the official geometry heads."""
     config = init_hydra_config(
@@ -180,7 +210,10 @@ def build_geometry_model(
     )
     model = init_model(config.model.model_str, config.model.model_config)
     report = load_geometry_state_dict(model, load_base_state_dict(base_checkpoint))
-    trainable = set_trainable_geometry_heads(model)
+    prefixes = list(TRAINABLE_PREFIXES)
+    if int(unfreeze_blocks) > 0:
+        prefixes.extend(info_sharing_block_prefixes(model, int(unfreeze_blocks)))
+    trainable = set_trainable_geometry_heads(model, prefixes=tuple(prefixes))
     model.to(device)
     return model, report, trainable
 
@@ -212,6 +245,9 @@ def build_amuse(
     rho=1.0,
     r=0.0,
     weight_lr_power=2.0,
+    low_lr_prefixes=(),
+    low_lr_muon_lr=None,
+    low_lr_aux_lr=None,
 ):
     """Build the pinned AMUSE optimizer over the allowlisted geometry heads.
 
@@ -224,8 +260,20 @@ def build_amuse(
         raise ValueError("AMUSE requires warmup_steps > 0")
 
     parameters = dict(model.named_parameters())
+    low_prefixes = tuple(low_lr_prefixes)
+    if low_prefixes and (low_lr_muon_lr is None or low_lr_aux_lr is None):
+        raise ValueError(
+            "low_lr_prefixes require both low_lr_muon_lr and low_lr_aux_lr"
+        )
+    if low_lr_muon_lr is not None and float(low_lr_muon_lr) <= 0:
+        raise ValueError("low_lr_muon_lr must be positive")
+    if low_lr_aux_lr is not None and float(low_lr_aux_lr) <= 0:
+        raise ValueError("low_lr_aux_lr must be positive")
     muon = []
     aux = []
+    muon_low = []
+    aux_low = []
+    matched_low = 0
     seen = set()
     for name in trainable_names:
         if name in seen:
@@ -236,38 +284,71 @@ def build_amuse(
         parameter = parameters[name]
         if not parameter.requires_grad:
             raise ValueError(f"trainable parameter is frozen: {name}")
+        is_low = bool(low_prefixes) and name.startswith(low_prefixes)
+        if is_low:
+            matched_low += 1
         if name.startswith(AMUSE_OUTPUT_PREFIXES) or parameter.ndim == 1:
-            aux.append(parameter)
+            (aux_low if is_low else aux).append(parameter)
         elif parameter.ndim in (2, 4):
-            muon.append(parameter)
+            (muon_low if is_low else muon).append(parameter)
         else:
             raise ValueError(
                 f"unexpected parameter rank {parameter.ndim} for {name}"
             )
-    if not muon or not aux:
-        raise ValueError("both AMUSE parameter groups must be non-empty")
-    if len(muon) + len(aux) != len(trainable_names):
+    if not muon and not aux and not muon_low and not aux_low:
+        raise ValueError("AMUSE requires at least one parameter group")
+    if len(muon) + len(aux) + len(muon_low) + len(aux_low) != len(trainable_names):
         raise ValueError("AMUSE group coverage mismatch")
+    if low_prefixes and matched_low == 0:
+        raise ValueError("low_lr_prefixes matched no trainable parameter")
 
-    param_groups = [
-        {
-            "params": muon,
-            "use_muon": True,
-            "lr": muon_lr,
-            "weight_decay": muon_weight_decay,
-            "momentum": muon_momentum,
-            "aux_update_type": "adamw",
-        },
-        {
-            "params": aux,
-            "use_muon": False,
-            "update_type": "adamw",
-            "lr": aux_lr,
-            "weight_decay": aux_weight_decay,
-            "beta2": aux_beta2,
-            "eps": aux_eps,
-        },
-    ]
+    param_groups = []
+    if muon:
+        param_groups.append(
+            {
+                "params": muon,
+                "use_muon": True,
+                "lr": muon_lr,
+                "weight_decay": muon_weight_decay,
+                "momentum": muon_momentum,
+                "aux_update_type": "adamw",
+            }
+        )
+    if muon_low:
+        param_groups.append(
+            {
+                "params": muon_low,
+                "use_muon": True,
+                "lr": low_lr_muon_lr,
+                "weight_decay": muon_weight_decay,
+                "momentum": muon_momentum,
+                "aux_update_type": "adamw",
+            }
+        )
+    if aux:
+        param_groups.append(
+            {
+                "params": aux,
+                "use_muon": False,
+                "update_type": "adamw",
+                "lr": aux_lr,
+                "weight_decay": aux_weight_decay,
+                "beta2": aux_beta2,
+                "eps": aux_eps,
+            }
+        )
+    if aux_low:
+        param_groups.append(
+            {
+                "params": aux_low,
+                "use_muon": False,
+                "update_type": "adamw",
+                "lr": low_lr_aux_lr,
+                "weight_decay": aux_weight_decay,
+                "beta2": aux_beta2,
+                "eps": aux_eps,
+            }
+        )
     optimizer = AMUSE(
         param_groups,
         beta1=beta1,
@@ -634,6 +715,13 @@ def validate_training_config(config):
         value = config.get(key)
         if value is not None and int(value) < 1:
             raise ValueError(f"{key} must be positive when provided")
+    for key in ("muon_lr", "aux_lr", "unfrozen_muon_lr", "unfrozen_aux_lr"):
+        value = config.get(key)
+        if value is not None and float(value) <= 0:
+            raise ValueError(f"{key} must be positive when provided")
+    blocks = config.get("unfreeze_blocks", 0)
+    if blocks is not None and int(blocks) < 0:
+        raise ValueError("unfreeze_blocks must be non-negative")
 
 
 def set_head_train_mode(model):
@@ -709,6 +797,71 @@ def flow_cache_digest(flow_root):
         digest.update(file_digest.encode("ascii"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def legacy_flow_digest(flow_root):
+    """Digest scheme used before content hashing (provenance files only)."""
+    digest = hashlib.sha256()
+    for name in ("manifest.json", "flow_quality.json"):
+        path = os.path.join(flow_root, name)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"flow cache misses {name}: {path}")
+        with open(path, "rb") as stream:
+            digest.update(stream.read())
+    return digest.hexdigest()
+
+
+def migrate_checkpoint_flow_digest(checkpoint_path, flow_root, output_path=None):
+    """Explicitly migrate a stored legacy ``flow_digest`` to the content digest.
+
+    The stored digest must equal the legacy digest computed from the same
+    cache, the cache manifest must match the checkpoint's dataset digest,
+    and the provenance fields must be present. The checkpoint is backed up
+    next to its path before the atomic rewrite.
+    """
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    stored = payload.get("flow_digest")
+    if stored is None:
+        raise ValueError(f"checkpoint has no flow_digest: {checkpoint_path}")
+    legacy = legacy_flow_digest(flow_root)
+    if stored != legacy:
+        raise ValueError(
+            f"stored flow_digest {stored!r} does not match the legacy digest "
+            f"{legacy!r} of {flow_root}; refusing to migrate"
+        )
+    manifest_path = os.path.join(flow_root, "manifest.json")
+    with open(manifest_path, encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    if not manifest.get("completed"):
+        raise ValueError("flow cache is not completed; refusing to migrate")
+    if manifest.get("dataset_digest") != payload.get("dataset_digest"):
+        raise ValueError(
+            "flow cache dataset digest does not match the checkpoint; "
+            "refusing to migrate"
+        )
+    for key in ("pose_convention", "teacher"):
+        if not manifest.get(key):
+            raise ValueError(
+                f"flow cache manifest misses provenance field {key!r}; "
+                "refusing to migrate"
+            )
+    new_digest = flow_cache_digest(flow_root)
+    if new_digest == stored:
+        return new_digest
+    payload["flow_digest"] = new_digest
+    resolved = payload.get("resolved_config")
+    if isinstance(resolved, dict):
+        contract = resolved.get("contract")
+        if isinstance(contract, dict):
+            contract["flow_digest"] = new_digest
+    target = output_path or checkpoint_path
+    if os.path.abspath(target) == os.path.abspath(checkpoint_path):
+        backup = f"{checkpoint_path}.pre_migration"
+        if not os.path.exists(backup):
+            with open(checkpoint_path, "rb") as source, open(backup, "wb") as sink:
+                sink.write(source.read())
+    _atomic_torch_save(payload, target)
+    return new_digest
 
 
 def evaluate_geometry(model, dataset, device, limit=None, use_amp=False):
@@ -889,15 +1042,41 @@ def run_geometry_training(
                 f"{split_name} split has no usable pseudo-dynamic flow targets"
             )
 
+    unfreeze_blocks = int(config.get("unfreeze_blocks", 0) or 0)
     if model is None:
         model, _, trainable_names = build_geometry_model(
-            config["config_dir"], config["base_checkpoint"], device=device
+            config["config_dir"],
+            config["base_checkpoint"],
+            device=device,
+            unfreeze_blocks=unfreeze_blocks,
         )
     else:
-        trainable_names = set_trainable_geometry_heads(model)
+        prefixes = list(TRAINABLE_PREFIXES)
+        if unfreeze_blocks > 0:
+            prefixes.extend(info_sharing_block_prefixes(model, unfreeze_blocks))
+        trainable_names = set_trainable_geometry_heads(model, prefixes=tuple(prefixes))
         model.to(device)
+    if unfreeze_blocks > 0:
+        low_prefixes = info_sharing_block_prefixes(model, unfreeze_blocks)
+        low_muon_lr = config.get("unfrozen_muon_lr")
+        low_aux_lr = config.get("unfrozen_aux_lr")
+        if low_muon_lr is None:
+            low_muon_lr = config.get("muon_lr", 1e-4) / 3.0
+        if low_aux_lr is None:
+            low_aux_lr = config.get("aux_lr", 1e-5) / 3.0
+    else:
+        low_prefixes = ()
+        low_muon_lr = None
+        low_aux_lr = None
     optimizer, manifest = build_amuse(
-        model, trainable_names, warmup_steps=config["warmup_steps"]
+        model,
+        trainable_names,
+        warmup_steps=config["warmup_steps"],
+        muon_lr=config.get("muon_lr", 1e-4),
+        aux_lr=config.get("aux_lr", 1e-5),
+        low_lr_prefixes=low_prefixes,
+        low_lr_muon_lr=low_muon_lr,
+        low_lr_aux_lr=low_aux_lr,
     )
     set_head_train_mode(model)
     named_parameters = dict(model.named_parameters())
