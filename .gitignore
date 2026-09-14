@@ -5,6 +5,10 @@ reference_data/
 outputs/
 .pixi/
 
+# Local artifacts
+*.rrd
+*.ply
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
