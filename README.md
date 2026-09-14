@@ -168,11 +168,12 @@ the agreement between predicted and input depth.
 ### RGB-D Tracking Demo (Rerun)
 
 `scripts/demo_rgbd_tracking.py` runs the same RGB-D inference and streams the reconstruction and
-tracking results to [Rerun](https://rerun.io/). The fixed layout shows the current frame's RGB and
-color-mapped input depth side by side above the metric point cloud and the trajectories of a fixed
-set of reference-view points. As in `scripts/demo_inference.py`, the tracks are obtained by adding
-the predicted world-frame scene flow of each view to the reference pointmap. Predicted depth and
-all-frame overlays are opt-in via `--show_predicted_depth` and `--show_all_frames`.
+tracking results to [Rerun](https://rerun.io/). By default only the current frame is shown: RGB and
+color-mapped input depth side by side, the camera, the metric point cloud and the world-frame scene
+flow arrows. The trajectories of a fixed set of reference-view points (`--show_tracks`, obtained by
+adding the predicted world-frame scene flow of each view to the reference pointmap, as in
+`scripts/demo_inference.py`), the camera path (`--show_camera_path`), the predicted depth
+(`--show_predicted_depth`) and the all-frame overlay (`--show_all_frames`) are opt-in.
 
 Passing `--session <dir>` resolves `<dir>/rgb` (or `Color_*.jpg`), `<dir>/mapped_depth` and
 `<dir>/camera_parameters/rgb_camera_param.yaml` automatically.

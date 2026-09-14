@@ -120,6 +120,16 @@ def get_parser():
         help="Also keep the point cloud and scene flow of every view as a static overlay (off by default).",
     )
     parser.add_argument(
+        "--show_tracks",
+        action="store_true",
+        help="Show the trajectories of the tracked reference-view points (off by default).",
+    )
+    parser.add_argument(
+        "--show_camera_path",
+        action="store_true",
+        help="Show the camera trajectory line (off by default).",
+    )
+    parser.add_argument(
         "--show_predicted_depth",
         action="store_true",
         help="Also show the predicted depth next to the RGB and input depth (off by default).",
@@ -241,6 +251,8 @@ def log_tracking(
     motion_threshold=0.05,
     show_all_frames=False,
     show_predicted_depth=False,
+    show_tracks=False,
+    show_camera_path=False,
 ):
     "Log cameras, images, point clouds, scene flow and point tracks to Rerun."
     images = [(image.clip(0, 1) * 255).astype(np.uint8) for image in data["images"]]
@@ -306,7 +318,8 @@ def log_tracking(
 
         # World-frame scene flow of the tracked reference points.
         scene_flow = data["scene_flows"][view_idx].reshape(-1, 3)[track_indices]
-        track_history.append(ref_points[track_indices] + scene_flow)
+        if show_tracks:
+            track_history.append(ref_points[track_indices] + scene_flow)
 
         magnitude = np.linalg.norm(scene_flow, axis=-1)
         moving = magnitude > motion_threshold
@@ -329,17 +342,22 @@ def log_tracking(
                     ),
                     static=True,
                 )
+        else:
+            # Clear the previous frame's arrows instead of leaving them behind.
+            rr.log("world/scene_flow", rr.Clear(recursive=False))
 
         # Trajectories of the tracked points as growing line strips.
-        history = np.stack(track_history, axis=0)  # (T, N, 3)
-        strips = [history[:, track] for track in range(history.shape[1])]
-        rr.log("world/point_tracks", rr.LineStrips3D(strips=strips, colors=track_colors))
+        if show_tracks:
+            history = np.stack(track_history, axis=0)  # (T, N, 3)
+            strips = [history[:, track] for track in range(history.shape[1])]
+            rr.log("world/point_tracks", rr.LineStrips3D(strips=strips, colors=track_colors))
 
-    rr.log(
-        "world/camera_path",
-        rr.LineStrips3D(strips=[np.stack(camera_positions, axis=0)]),
-        static=True,
-    )
+    if show_camera_path:
+        rr.log(
+            "world/camera_path",
+            rr.LineStrips3D(strips=[np.stack(camera_positions, axis=0)]),
+            static=True,
+        )
 
 
 def main():
@@ -409,6 +427,8 @@ def main():
         motion_threshold=args.motion_threshold,
         show_all_frames=args.show_all_frames,
         show_predicted_depth=args.show_predicted_depth,
+        show_tracks=args.show_tracks,
+        show_camera_path=args.show_camera_path,
     )
     print(f"Logged {len(views)} views to Rerun")
 
