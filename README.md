@@ -160,6 +160,32 @@ to select and batch the input views, `--task images_only` for RGB-only inference
 masks) are written per view as compressed `.npz` files together with a `summary.json` that reports
 the agreement between predicted and input depth.
 
+### RGB-D Tracking Demo (Rerun)
+
+`scripts/demo_rgbd_tracking.py` runs the same RGB-D inference and streams the reconstruction and
+tracking results to [Rerun](https://rerun.io/): per-view camera transform, pinhole, RGB, input and
+predicted depth, metric point clouds, world-frame scene flow arrows, and the trajectories of a fixed
+set of reference-view points. As in `scripts/demo_inference.py`, the tracks are obtained by adding
+the predicted world-frame scene flow of each view to the reference pointmap. Use `--stride` to cover
+a longer sequence with fewer views.
+
+```bash
+# Terminal 1: Start the Rerun server
+rerun serve --port 9877
+
+# Terminal 2: Run the tracking demo
+python scripts/demo_rgbd_tracking.py \
+    --rgb_dir /path/to/rgb \
+    --depth_dir /path/to/depth \
+    --camera_params /path/to/rgb_camera_param.yaml \
+    --start_idx 0 --end_idx 240 --stride 30 \
+    --max_track_points 500 --port 9877
+
+# Or save a recording without a running viewer
+python scripts/demo_rgbd_tracking.py ... --connect false --headless true --save outputs/tracking.rrd
+rerun outputs/tracking.rrd
+```
+
 
 ## Interactive Demos
 

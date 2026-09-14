@@ -8,23 +8,12 @@
 # can be fed to the model as a geometric input.
 # --------------------------------------------------------
 import argparse
-import gc
 import json
 import os
-from glob import glob
-from pathlib import Path
 
-import cv2
-import hydra
 import numpy as np
 import torch
-import torchvision.transforms as tvf
-from PIL import Image
-from PIL.ImageOps import exif_transpose
 
-from any4d.models import init_model
-from any4d.utils.cropping import crop_resize_if_necessary
-from any4d.utils.image import find_closest_aspect_ratio
 from any4d.utils.inference import (
     loss_of_one_batch_multi_view,
     postprocess_model_outputs_for_inference,
@@ -32,9 +21,14 @@ from any4d.utils.inference import (
     validate_input_views_for_inference,
 )
 from any4d.utils.misc import seed_everything
-from uniception.models.encoders.image_normalizations import IMAGE_NORMALIZATION_DICT
-
-SUPPORTED_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp")
+from any4d.utils.rgbd import (
+    build_image_normalizer,
+    compute_target_size,
+    find_pairs,
+    init_inference_model,
+    load_intrinsics,
+    load_rgbd_view,
+)
 
 
 def get_parser():
@@ -106,178 +100,6 @@ def get_parser():
     parser.add_argument("--seed", type=int, default=0)
 
     return parser
-
-
-def init_hydra_config(config_path, overrides=None):
-    "Initialize a Hydra config relative to this script (same convention as scripts/demo_inference.py)."
-    config_dir = os.path.dirname(os.path.abspath(config_path))
-    config_name = os.path.basename(config_path).split(".")[0]
-    relative_path = os.path.relpath(config_dir, os.path.dirname(os.path.abspath(__file__)))
-    hydra.core.global_hydra.GlobalHydra.instance().clear()
-    hydra.initialize(version_base=None, config_path=relative_path)
-    if overrides is not None:
-        return hydra.compose(config_name=config_name, overrides=overrides)
-    return hydra.compose(config_name=config_name)
-
-
-def init_inference_model(config_dir, task, machine, checkpoint_path, device):
-    "Build the Any4D model from the config and load the official checkpoint."
-    model_args = init_hydra_config(
-        os.path.join(config_dir, "train.yaml"),
-        overrides=[
-            f"machine={machine}",
-            "model=any4d",
-            "model.encoder.uses_torch_hub=false",
-            f"model/task={task}",
-        ],
-    )
-    model = init_model(model_args.model.model_str, model_args.model.model_config)
-    model.to(device)
-
-    if checkpoint_path is not None:
-        print(f"Loading model from: {checkpoint_path}")
-        try:
-            # Memory-map the checkpoint when possible to avoid a full extra copy in RAM.
-            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
-        except (RuntimeError, TypeError, ValueError):
-            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        print(model.load_state_dict(ckpt["model"], strict=False))
-        del ckpt
-        gc.collect()
-    model.to(device)
-    model.eval()
-
-    return model, model_args.model.data_norm_type
-
-
-def stem_key(path):
-    "Pair RGB and depth files by their stem, ignoring '_rgb'/'_depth' suffixes and 'color_'/'depth_' prefixes."
-    stem = Path(path).stem
-    lowered = stem.lower()
-    for suffix in ("_rgb", "_depth"):
-        if lowered.endswith(suffix):
-            stem = stem[: -len(suffix)]
-            lowered = stem.lower()
-            break
-    for prefix in ("color_", "depth_", "rgb_"):
-        if lowered.startswith(prefix):
-            stem = stem[len(prefix) :]
-            break
-    return stem
-
-
-def find_pairs(rgb_dir, depth_dir):
-    "Return a sorted list of (key, rgb_path, depth_path) tuples."
-    rgb_files = sorted(
-        p
-        for p in glob(os.path.join(rgb_dir, "*"))
-        if p.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS) and "depth" not in os.path.basename(p).lower()
-    )
-    depth_files = sorted(
-        p
-        for p in glob(os.path.join(depth_dir, "*"))
-        if p.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS) and "rgb" not in os.path.basename(p).lower()
-    )
-    if os.path.abspath(rgb_dir) == os.path.abspath(depth_dir):
-        # When RGB and depth live in the same folder, keep only depth-like file names.
-        depth_files = [p for p in depth_files if "depth" in os.path.basename(p).lower()]
-    depth_by_key = {stem_key(p): p for p in depth_files}
-
-    pairs = []
-    for rgb_path in rgb_files:
-        key = stem_key(rgb_path)
-        if key in depth_by_key:
-            pairs.append((key, rgb_path, depth_by_key[key]))
-    pairs.sort(key=lambda pair: pair[0])
-    return pairs
-
-
-def load_intrinsics(args):
-    "Build a 3x3 intrinsics matrix from CLI values or a camera parameter file."
-    if args.fx is not None:
-        if None in (args.fy, args.cx, args.cy):
-            raise ValueError("--fx requires --fy, --cx and --cy to be provided as well.")
-        return np.array(
-            [[args.fx, 0.0, args.cx], [0.0, args.fy, args.cy], [0.0, 0.0, 1.0]], dtype=np.float32
-        )
-    if args.camera_params is None:
-        raise ValueError(
-            "Provide camera intrinsics through --camera_params or --fx/--fy/--cx/--cy. "
-            "Depth conditioning requires camera calibration to convert Z depth to depth along the ray."
-        )
-
-    with open(args.camera_params, encoding="utf-8") as stream:
-        if str(args.camera_params).lower().endswith((".yaml", ".yml")):
-            import yaml
-
-            params = yaml.safe_load(stream)
-        else:
-            params = json.load(stream)
-
-    if "K" in params:
-        intrinsics = np.array(params["K"], dtype=np.float32).reshape(3, 3)
-    elif all(k in params for k in ("fx", "fy", "cx", "cy")):
-        intrinsics = np.array(
-            [
-                [params["fx"], 0.0, params["cx"]],
-                [0.0, params["fy"], params["cy"]],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float32,
-        )
-    else:
-        raise ValueError(
-            f"{args.camera_params} must contain either 'K' or 'fx'/'fy'/'cx'/'cy' entries."
-        )
-    return intrinsics
-
-
-def compute_target_size(pairs, resolution_set):
-    "Pick the model input resolution from the average aspect ratio, as in any4d.utils.image.load_images."
-    aspect_ratios = []
-    for _, rgb_path, _ in pairs:
-        with Image.open(rgb_path) as image:
-            width, height = exif_transpose(image).size
-        aspect_ratios.append(width / height)
-    average_aspect_ratio = sum(aspect_ratios) / len(aspect_ratios)
-    return find_closest_aspect_ratio(average_aspect_ratio, resolution_set)
-
-
-def load_rgbd_view(rgb_path, depth_path, intrinsics, target_size, depth_scale, max_depth, img_norm):
-    "Load, resize and normalize an RGB-D pair into a model view dictionary."
-    image = exif_transpose(Image.open(rgb_path)).convert("RGB")
-
-    depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-    if depth is None:
-        raise OSError(f"Could not load depth map: {depth_path}")
-    if depth.ndim == 3:
-        depth = depth[..., 0]
-    depth = depth.astype(np.float32) * depth_scale
-    if max_depth is not None:
-        depth[depth > max_depth] = 0.0
-
-    if depth.shape[:2] != (image.size[1], image.size[0]):
-        depth = cv2.resize(depth, image.size, interpolation=cv2.INTER_NEAREST)
-
-    valid_mask = (depth > 0).astype(np.uint8)
-    image, depth, intrinsics, additional = crop_resize_if_necessary(
-        image,
-        target_size,
-        depthmap=depth,
-        intrinsics=intrinsics.copy(),
-        additional_quantities=[valid_mask],
-    )
-    valid_mask = additional[0].astype(np.float32)
-
-    view = {
-        "img": img_norm(image)[None],
-        "depth_z": torch.from_numpy(depth)[None, ..., None].float(),
-        "intrinsics": torch.from_numpy(np.asarray(intrinsics, dtype=np.float32))[None],
-        "is_metric_scale": torch.ones(1, dtype=torch.bool),
-        "data_norm_type": [None],  # replaced by the caller
-        "true_shape": np.int32([image.size[::-1]]),
-    }
-    return view, valid_mask
 
 
 @torch.no_grad()
@@ -390,25 +212,19 @@ def main():
     target_size = compute_target_size(pairs, args.resolution_set)
     print(f"Using target resolution {target_size[0]}x{target_size[1]} (W x H)")
 
-    intrinsics = load_intrinsics(args)
-    if (intrinsics[0, 2] >= target_size[0] * 2 or intrinsics[1, 2] >= target_size[1] * 2):
+    intrinsics = load_intrinsics(
+        camera_params=args.camera_params, fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy
+    )
+    if intrinsics[0, 2] >= target_size[0] * 2 or intrinsics[1, 2] >= target_size[1] * 2:
         raise ValueError(
             f"Principal point {intrinsics[:2, 2]} looks inconsistent with the input images. "
             "Make sure the intrinsics correspond to the original RGB resolution."
         )
 
     model, data_norm_type = init_inference_model(
-        args.config_dir, args.task, args.machine, args.checkpoint_path, device
+        args.config_dir, args.checkpoint_path, task=args.task, machine=args.machine, device=device
     )
-    img_norm = tvf.Compose(
-        [
-            tvf.ToTensor(),
-            tvf.Normalize(
-                mean=IMAGE_NORMALIZATION_DICT[data_norm_type].mean,
-                std=IMAGE_NORMALIZATION_DICT[data_norm_type].std,
-            ),
-        ]
-    )
+    img_norm = build_image_normalizer(data_norm_type)
 
     chunk_size = args.chunk_size if args.chunk_size > 0 else len(pairs)
     use_amp = not args.no_amp
@@ -422,11 +238,11 @@ def main():
                 depth_path,
                 intrinsics,
                 target_size,
-                args.depth_scale,
-                args.max_depth,
-                img_norm,
+                depth_scale=args.depth_scale,
+                max_depth=args.max_depth,
+                img_norm=img_norm,
+                data_norm_type=data_norm_type,
             )
-            view["data_norm_type"] = [data_norm_type]
             views.append(view)
             valid_masks.append(valid_mask)
             keys.append(key)
