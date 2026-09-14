@@ -24,9 +24,13 @@ torchaudio = { version = "==2.8.0", index = "https://download.pytorch.org/whl/cu
 download-checkpoint = "python scripts/download_checkpoint.py"
 # RGB-D inference with the official pretrained checkpoint (see --help for arguments)
 infer-rgbd = "python scripts/inference_rgbd.py"
+# RGB-D tracking demo with Rerun. Example: pixi run track-rgbd --session /path/to/session --save out.rrd
+track-rgbd = "python scripts/demo_rgbd_tracking.py"
 # Quick GPU sanity check
 gpu-check = "python -c \"import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')\""
 # Local Rerun viewer connecting to the default demo port (start `pixi run rerun-serve` on the host first)
 rerun-view = "rerun --connect rerun+http://127.0.0.1:9877/proxy"
 # Rerun server + web viewer (headless machines; forward ports 9877 and 9879)
 rerun-serve = "rerun serve --port 9877 --web-viewer-port 9879"
+# Open a saved recording in the local Rerun viewer (append the .rrd path)
+rerun-open = "rerun"

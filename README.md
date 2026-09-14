@@ -144,6 +144,7 @@ expected to be single-channel images where `0` marks invalid pixels; use `--dept
 stored values to meters (`0.001` for millimeter `uint16` PNGs).
 
 ```bash
+# Explicit directories
 python scripts/inference_rgbd.py \
     --rgb_dir /path/to/rgb \
     --depth_dir /path/to/depth \
@@ -151,6 +152,10 @@ python scripts/inference_rgbd.py \
     --checkpoint_path checkpoints/any4d_4v_combined.pth \
     --output_dir outputs/rgbd_run \
     --save_ply
+
+# Or a session root that contains rgb/, mapped_depth/ and camera_parameters/
+pixi run infer-rgbd --session /path/to/session \
+    --start_idx 0 --end_idx 4 --output_dir outputs/rgbd_run
 ```
 
 RGB and depth files are paired by file stem (a trailing `_rgb`/`_depth` suffix and a leading
@@ -163,27 +168,33 @@ the agreement between predicted and input depth.
 ### RGB-D Tracking Demo (Rerun)
 
 `scripts/demo_rgbd_tracking.py` runs the same RGB-D inference and streams the reconstruction and
-tracking results to [Rerun](https://rerun.io/): per-view camera transform, pinhole, RGB, input and
-predicted depth, metric point clouds, world-frame scene flow arrows, and the trajectories of a fixed
+tracking results to [Rerun](https://rerun.io/). The fixed layout shows the current frame's RGB and
+color-mapped input depth side by side above the metric point cloud and the trajectories of a fixed
 set of reference-view points. As in `scripts/demo_inference.py`, the tracks are obtained by adding
-the predicted world-frame scene flow of each view to the reference pointmap. Use `--stride` to cover
-a longer sequence with fewer views.
+the predicted world-frame scene flow of each view to the reference pointmap. Predicted depth and
+all-frame overlays are opt-in via `--show_predicted_depth` and `--show_all_frames`.
+
+Passing `--session <dir>` resolves `<dir>/rgb` (or `Color_*.jpg`), `<dir>/mapped_depth` and
+`<dir>/camera_parameters/rgb_camera_param.yaml` automatically.
 
 ```bash
-# Terminal 1: Start the Rerun server
+# Terminal 1: Start the Rerun server (or `pixi run rerun-serve`)
 rerun serve --port 9877
 
-# Terminal 2: Run the tracking demo
-python scripts/demo_rgbd_tracking.py \
-    --rgb_dir /path/to/rgb \
-    --depth_dir /path/to/depth \
-    --camera_params /path/to/rgb_camera_param.yaml \
-    --start_idx 0 --end_idx 240 --stride 30 \
-    --max_track_points 500 --port 9877
+# Terminal 2: Live view (connects to rerun+http://127.0.0.1:9877/proxy by default)
+pixi run track-rgbd --session /path/to/session \
+    --start_idx 0 --end_idx 240 --stride 30 --connect
 
-# Or save a recording without a running viewer
-python scripts/demo_rgbd_tracking.py ... --connect false --headless true --save outputs/tracking.rrd
-rerun outputs/tracking.rrd
+# Save a recording and open it later (no viewer required while running)
+pixi run track-rgbd --session /path/to/session \
+    --start_idx 0 --end_idx 240 --stride 30 --save outputs/tracking.rrd
+pixi run rerun-open outputs/tracking.rrd
+
+# Explicit directories also work
+pixi run track-rgbd \
+    --rgb_dir /path/to/rgb --depth_dir /path/to/depth \
+    --camera_params /path/to/rgb_camera_param.yaml \
+    --save outputs/tracking.rrd
 ```
 
 

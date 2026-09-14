@@ -3,10 +3,10 @@
 #
 # Runs RGB-D inference with the official checkpoint (no MoGe) and logs the
 # reconstruction together with tracking results to Rerun:
-#   - per-view camera transform, pinhole, RGB, input/predicted depth
-#   - per-view metric point cloud
-#   - scene flow arrows (world frame)
+#   - current-frame RGB and color-mapped input depth side by side
+#   - current-frame camera transform, metric point cloud and scene flow
 #   - trajectories of a fixed set of reference-view points over time
+#   - all-frame overlays and predicted depth are opt-in
 #
 # Point tracks are obtained by adding the predicted world-frame scene flow of
 # every view to the pointmap of the reference view (view 0), following the
@@ -17,6 +17,13 @@ import argparse
 import numpy as np
 import rerun as rr
 import torch
+from rerun.blueprint import (
+    Blueprint,
+    Horizontal,
+    Spatial2DView,
+    Spatial3DView,
+    Vertical,
+)
 
 from any4d.utils.geometry import (
     quaternion_to_rotation_matrix,
@@ -36,20 +43,24 @@ from any4d.utils.rgbd import (
     init_inference_model,
     load_intrinsics,
     load_rgbd_view,
+    resolve_session_paths,
 )
 from any4d.utils.viz import script_add_rerun_args
+
+DEFAULT_RERUN_URL = "rerun+http://127.0.0.1:9877/proxy"
 
 
 def get_parser():
     parser = argparse.ArgumentParser(description="Multi-view RGB-D tracking demo with Any4D + Rerun.")
-    parser.add_argument("--rgb_dir", type=str, required=True, help="Directory containing RGB images.")
     parser.add_argument(
-        "--depth_dir",
+        "--session",
         type=str,
-        required=True,
-        help="Directory containing depth maps aligned to the RGB camera. Files are paired with the RGB "
-        "images by matching file stems (a trailing '_rgb'/'_depth' suffix is ignored).",
+        default=None,
+        help="Session root directory. Resolves <session>/rgb (or Color_*.jpg), "
+        "<session>/mapped_depth and <session>/camera_parameters/rgb_camera_param.yaml automatically.",
     )
+    parser.add_argument("--rgb_dir", type=str, default=None, help="RGB directory (alternative to --session).")
+    parser.add_argument("--depth_dir", type=str, default=None, help="Depth directory (alternative to --session).")
     parser.add_argument(
         "--checkpoint_path",
         type=str,
@@ -103,28 +114,89 @@ def get_parser():
         default=0.05,
         help="Minimum scene flow magnitude in meters for a scene flow arrow to be drawn.",
     )
-    parser.add_argument("--port", type=int, default=9876, help="Rerun server port.")
+    parser.add_argument(
+        "--show_all_frames",
+        action="store_true",
+        help="Also keep the point cloud and scene flow of every view as a static overlay (off by default).",
+    )
+    parser.add_argument(
+        "--show_predicted_depth",
+        action="store_true",
+        help="Also show the predicted depth next to the RGB and input depth (off by default).",
+    )
     parser.add_argument("--no_amp", action="store_true", help="Disable bfloat16 autocast.")
     parser.add_argument("--seed", type=int, default=0)
 
     script_add_rerun_args(parser)
+    # Default to the port used by `pixi run rerun-serve`/`rerun-view` and make
+    # `--save` the default mode instead of silently connecting to a viewer.
+    parser.set_defaults(connect=False, headless=True, url=DEFAULT_RERUN_URL)
     return parser
+
+
+def resolve_inputs(args):
+    "Resolve rgb/depth/camera-parameter paths from --session or explicit directories."
+    rgb_dir, depth_dir, camera_params = args.rgb_dir, args.depth_dir, args.camera_params
+    if args.session is not None:
+        rgb_dir, depth_dir, camera_params = resolve_session_paths(args.session, camera_params)
+    if rgb_dir is None or depth_dir is None:
+        raise ValueError("Provide --session or both --rgb_dir and --depth_dir.")
+    return rgb_dir, depth_dir, camera_params
+
+
+def get_colormap(name):
+    "Return a matplotlib colormap callable."
+    import matplotlib
+
+    if hasattr(matplotlib, "colormaps"):
+        return matplotlib.colormaps[name]
+    return matplotlib.cm.get_cmap(name)
 
 
 def cmap_colors(values, name="rainbow"):
     "Map scalar values to uint8 RGB colors using a matplotlib colormap."
-    import matplotlib
-
     values = np.asarray(values, dtype=np.float64)
     if values.size == 0:
         return np.zeros((0, 3), dtype=np.uint8)
     vmin, vmax = float(values.min()), float(values.max())
     normalized = (values - vmin) / max(vmax - vmin, 1e-8)
-    if hasattr(matplotlib, "colormaps"):
-        colormap = matplotlib.colormaps[name]
-    else:
-        colormap = matplotlib.cm.get_cmap(name)
-    return (colormap(normalized)[:, :3] * 255).astype(np.uint8)
+    return (get_colormap(name)(normalized)[:, :3] * 255).astype(np.uint8)
+
+
+def depth_color_range(depths, low_percentile=2.0, high_percentile=98.0):
+    "Fixed color range (meters) for a sequence of depth maps."
+    valid = np.concatenate([depth[depth > 0].reshape(-1) for depth in depths])
+    if valid.size == 0:
+        return 0.0, 1.0
+    vmin, vmax = np.percentile(valid, [low_percentile, high_percentile])
+    if vmax <= vmin:
+        vmax = vmin + 1e-3
+    return float(vmin), float(vmax)
+
+
+def colorize_depth(depth, vmin, vmax, name="turbo"):
+    "Color-map a depth map with a fixed range; invalid pixels become black."
+    normalized = np.clip((depth - vmin) / max(vmax - vmin, 1e-8), 0.0, 1.0)
+    colors = (get_colormap(name)(normalized)[..., :3] * 255).astype(np.uint8)
+    colors[depth <= 0] = 0
+    return colors
+
+
+def build_blueprint(show_predicted_depth=False):
+    "Fixed layout: RGB | input depth on top, 3D reconstruction and tracks below."
+    views_2d = [
+        Spatial2DView(origin="world/camera/pinhole/rgb", name="RGB"),
+        Spatial2DView(origin="world/camera/pinhole/depth_input", name="Input depth"),
+    ]
+    if show_predicted_depth:
+        views_2d.append(Spatial2DView(origin="world/camera/pinhole/depth_pred", name="Predicted depth"))
+    return Blueprint(
+        Vertical(
+            Horizontal(*views_2d),
+            Spatial3DView(origin="world", name="3D + tracks"),
+        ),
+        collapse_panels=True,
+    )
 
 
 def gather_view_data(processed, input_views):
@@ -162,11 +234,21 @@ def select_track_indices(valid_mask, max_track_points, rng):
     return candidates
 
 
-def log_tracking(data, valid_masks, max_track_points=500, motion_threshold=0.05):
-    "Log cameras, point clouds, scene flow and point tracks to Rerun."
-    images = data["images"]
+def log_tracking(
+    data,
+    valid_masks,
+    max_track_points=500,
+    motion_threshold=0.05,
+    show_all_frames=False,
+    show_predicted_depth=False,
+):
+    "Log cameras, images, point clouds, scene flow and point tracks to Rerun."
+    images = [(image.clip(0, 1) * 255).astype(np.uint8) for image in data["images"]]
     pts3d = data["pts3d"]
     num_views = len(images)
+
+    # Fixed depth color range over the whole sequence so colors are comparable.
+    depth_vmin, depth_vmax = depth_color_range(data["input_depths"])
 
     rr.log("world", rr.ViewCoordinates.RDF, static=True)
 
@@ -179,15 +261,15 @@ def log_tracking(data, valid_masks, max_track_points=500, motion_threshold=0.05)
 
     for view_idx in range(num_views):
         rr.set_time("view", sequence=view_idx)
-        base = f"world/view_{view_idx:03d}"
-
-        cam_rot = quaternion_to_rotation_matrix(torch.from_numpy(data["cam_quats"][view_idx])).numpy()
-        rr.log(base, rr.Transform3D(translation=data["cam_trans"][view_idx], mat3x3=cam_rot))
-        camera_positions.append(data["cam_trans"][view_idx])
 
         height, width = images[view_idx].shape[:2]
+        cam_rot = quaternion_to_rotation_matrix(torch.from_numpy(data["cam_quats"][view_idx])).numpy()
+
+        # `world/points`, `world/scene_flow` and `world/point_tracks` are already
+        # in world coordinates, so they are logged outside the camera transform.
+        rr.log("world/camera", rr.Transform3D(translation=data["cam_trans"][view_idx], mat3x3=cam_rot))
         rr.log(
-            f"{base}/pinhole",
+            "world/camera/pinhole",
             rr.Pinhole(
                 image_from_camera=data["intrinsics"][view_idx],
                 height=height,
@@ -195,18 +277,29 @@ def log_tracking(data, valid_masks, max_track_points=500, motion_threshold=0.05)
                 camera_xyz=rr.ViewCoordinates.RDF,
             ),
         )
+        rr.log("world/camera/pinhole/rgb", rr.Image(images[view_idx]))
         rr.log(
-            f"{base}/pinhole/rgb",
-            rr.Image((images[view_idx].clip(0, 1) * 255).astype(np.uint8)),
+            "world/camera/pinhole/depth_input",
+            rr.Image(colorize_depth(data["input_depths"][view_idx], depth_vmin, depth_vmax)),
         )
-        rr.log(f"{base}/pinhole/depth_pred", rr.DepthImage(data["depth_z"][view_idx]))
-        rr.log(f"{base}/pinhole/depth_input", rr.DepthImage(data["input_depths"][view_idx]))
+        if show_predicted_depth:
+            rr.log(
+                "world/camera/pinhole/depth_pred",
+                rr.Image(colorize_depth(data["depth_z"][view_idx], depth_vmin, depth_vmax)),
+            )
+        camera_positions.append(data["cam_trans"][view_idx])
 
         valid = valid_masks[view_idx] > 0
         rr.log(
-            f"{base}/points",
+            "world/points",
             rr.Points3D(positions=pts3d[view_idx][valid], colors=images[view_idx][valid]),
         )
+        if show_all_frames:
+            rr.log(
+                f"world/all_frames/view_{view_idx:03d}/points",
+                rr.Points3D(positions=pts3d[view_idx][valid], colors=images[view_idx][valid]),
+                static=True,
+            )
 
         if view_idx == 0:
             continue
@@ -219,13 +312,23 @@ def log_tracking(data, valid_masks, max_track_points=500, motion_threshold=0.05)
         moving = magnitude > motion_threshold
         if moving.any():
             rr.log(
-                f"{base}/scene_flow",
+                "world/scene_flow",
                 rr.Arrows3D(
                     origins=ref_points[track_indices][moving],
                     vectors=scene_flow[moving],
                     colors=cmap_colors(magnitude[moving], "turbo"),
                 ),
             )
+            if show_all_frames:
+                rr.log(
+                    f"world/all_frames/view_{view_idx:03d}/scene_flow",
+                    rr.Arrows3D(
+                        origins=ref_points[track_indices][moving],
+                        vectors=scene_flow[moving],
+                        colors=cmap_colors(magnitude[moving], "turbo"),
+                    ),
+                    static=True,
+                )
 
         # Trajectories of the tracked points as growing line strips.
         history = np.stack(track_history, axis=0)  # (T, N, 3)
@@ -243,16 +346,19 @@ def main():
     args = get_parser().parse_args()
     seed_everything(args.seed)
 
-    rr.script_setup(args, "any4d_rgbd_tracking")
-    if args.connect:
-        rr.connect_grpc(f"rerun+http://127.0.0.1:{args.port}/proxy", flush_timeout_sec=None)
+    rgb_dir, depth_dir, camera_params = resolve_inputs(args)
+
+    blueprint = build_blueprint(args.show_predicted_depth)
+    rr.script_setup(args, "any4d_rgbd_tracking", default_blueprint=blueprint)
+    if not (args.save or args.connect or args.serve or args.stdout or not args.headless):
+        print("Rerun logging is disabled: pass --save, --connect, --serve, --stdout or --headless false.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    pairs = find_pairs(args.rgb_dir, args.depth_dir)
+    pairs = find_pairs(rgb_dir, depth_dir)
     if not pairs:
         raise ValueError(
-            f"No RGB/depth pairs found between {args.rgb_dir} and {args.depth_dir}. "
+            f"No RGB/depth pairs found between {rgb_dir} and {depth_dir}. "
             "RGB and depth files must share the same stem."
         )
     pairs = pairs[args.start_idx : args.end_idx : args.stride]
@@ -262,7 +368,7 @@ def main():
     print(f"Using target resolution {target_size[0]}x{target_size[1]} (W x H)")
 
     intrinsics = load_intrinsics(
-        camera_params=args.camera_params, fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy
+        camera_params=camera_params, fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy
     )
     model, data_norm_type = init_inference_model(
         args.config_dir, args.checkpoint_path, task=args.task, machine=args.machine, device=device
@@ -301,6 +407,8 @@ def main():
         valid_masks,
         max_track_points=args.max_track_points,
         motion_threshold=args.motion_threshold,
+        show_all_frames=args.show_all_frames,
+        show_predicted_depth=args.show_predicted_depth,
     )
     print(f"Logged {len(views)} views to Rerun")
 

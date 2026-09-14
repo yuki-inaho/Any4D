@@ -28,18 +28,24 @@ from any4d.utils.rgbd import (
     init_inference_model,
     load_intrinsics,
     load_rgbd_view,
+    resolve_session_paths,
 )
 
 
 def get_parser():
     parser = argparse.ArgumentParser(description="Multi-view RGB-D inference with Any4D.")
-    parser.add_argument("--rgb_dir", type=str, required=True, help="Directory containing RGB images.")
     parser.add_argument(
-        "--depth_dir",
+        "--session",
         type=str,
-        required=True,
-        help="Directory containing depth maps aligned to the RGB camera. Files are paired with the RGB "
-        "images by matching file stems (a trailing '_rgb'/'_depth' suffix is ignored).",
+        default=None,
+        help="Session root directory. Resolves <session>/rgb (or Color_*.jpg), "
+        "<session>/mapped_depth and <session>/camera_parameters/rgb_camera_param.yaml automatically.",
+    )
+    parser.add_argument(
+        "--rgb_dir", type=str, default=None, help="RGB directory (alternative to --session)."
+    )
+    parser.add_argument(
+        "--depth_dir", type=str, default=None, help="Depth directory (alternative to --session)."
     )
     parser.add_argument(
         "--checkpoint_path",
@@ -198,12 +204,18 @@ def main():
     args = get_parser().parse_args()
     seed_everything(args.seed)
 
+    rgb_dir, depth_dir, camera_params = args.rgb_dir, args.depth_dir, args.camera_params
+    if args.session is not None:
+        rgb_dir, depth_dir, camera_params = resolve_session_paths(args.session, camera_params)
+    if rgb_dir is None or depth_dir is None:
+        raise ValueError("Provide --session or both --rgb_dir and --depth_dir.")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    pairs = find_pairs(args.rgb_dir, args.depth_dir)
+    pairs = find_pairs(rgb_dir, depth_dir)
     if not pairs:
         raise ValueError(
-            f"No RGB/depth pairs found between {args.rgb_dir} and {args.depth_dir}. "
+            f"No RGB/depth pairs found between {rgb_dir} and {depth_dir}. "
             "RGB and depth files must share the same stem."
         )
     pairs = pairs[args.start_idx : args.end_idx : args.stride]
@@ -213,7 +225,7 @@ def main():
     print(f"Using target resolution {target_size[0]}x{target_size[1]} (W x H)")
 
     intrinsics = load_intrinsics(
-        camera_params=args.camera_params, fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy
+        camera_params=camera_params, fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy
     )
     if intrinsics[0, 2] >= target_size[0] * 2 or intrinsics[1, 2] >= target_size[1] * 2:
         raise ValueError(

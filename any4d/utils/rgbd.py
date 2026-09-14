@@ -70,6 +70,40 @@ def find_pairs(rgb_dir, depth_dir):
     return pairs
 
 
+def resolve_session_paths(session_dir, camera_params=None):
+    """
+    Resolve rgb/depth/camera-parameter paths from a single session directory.
+
+    Supported layouts:
+        - <session>/rgb/*_rgb.png + <session>/mapped_depth/*_depth.png
+        - <session>/Color_*.{jpg,png} + <session>/mapped_depth/Depth_*.png
+    """
+    if not os.path.isdir(session_dir):
+        raise FileNotFoundError(f"Session directory not found: {session_dir}")
+
+    rgb_dir = os.path.join(session_dir, "rgb")
+    if not os.path.isdir(rgb_dir):
+        rgb_dir = session_dir
+
+    depth_dir = os.path.join(session_dir, "mapped_depth")
+    if not os.path.isdir(depth_dir):
+        raise FileNotFoundError(
+            f"No 'mapped_depth' directory under {session_dir}. "
+            "Pass --rgb_dir/--depth_dir explicitly for other layouts."
+        )
+
+    if camera_params is None:
+        candidate = os.path.join(session_dir, "camera_parameters", "rgb_camera_param.yaml")
+        if os.path.exists(candidate):
+            camera_params = candidate
+    if camera_params is None:
+        raise FileNotFoundError(
+            f"No camera parameters found under {session_dir}. "
+            "Pass --camera_params pointing to a ROS-style camera info file or --fx/--fy/--cx/--cy."
+        )
+    return rgb_dir, depth_dir, camera_params
+
+
 def load_intrinsics(camera_params=None, fx=None, fy=None, cx=None, cy=None):
     "Build a 3x3 intrinsics matrix from explicit values or a camera parameter file."
     if fx is not None:
