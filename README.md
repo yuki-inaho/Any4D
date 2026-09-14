@@ -85,6 +85,17 @@ pre-commit install
 
 Note that we don't pin a specific version of PyTorch or CUDA in our requirements. Please feel free to install PyTorch based on your specific system.
 
+#### Pixi (alternative)
+
+A `pixi.toml` is provided as a reproducible alternative to conda. It pins PyTorch to the
+CUDA 12.8 wheels, which are required for Blackwell GPUs (e.g. RTX 50 series):
+```bash
+pixi install
+pixi run gpu-check          # sanity check: torch + CUDA device
+pixi run download-checkpoint
+pixi run python scripts/demo_inference.py --video_images_folder_path assets/stroller --viz
+```
+
 ## Model Checkpoints
 
 We release the pre-trained Any4D model checkpoint on Hugging Face and Google Drive:
@@ -95,6 +106,9 @@ We release the pre-trained Any4D model checkpoint on Hugging Face and Google Dri
 # Option 1: Hugging Face
 mkdir -p checkpoints
 wget -P checkpoints https://huggingface.co/airlabshare/any4d-checkpoint/resolve/main/any4d_4v_combined.pth
+
+# Or use the helper script (also used by `pixi run download-checkpoint`)
+python scripts/download_checkpoint.py --output-dir checkpoints
 ```
 
 **[☁️ Google Drive Link](https://drive.google.com/drive/folders/1SOWr61vuv_bGtow6diAiWpIoUT50qSpk?usp=drive_link)**
@@ -120,6 +134,31 @@ python scripts/demo_inference.py --video_images_folder_path assets/stroller --vi
 ```
 
 We provide multiple examples at [assets/example_images](assets/example_images). Please look at [Rerun Demo](#rerun-demo) for more control over visualization.
+
+### RGB-D Inference (without MoGe)
+
+If depth maps aligned to the RGB camera are available, `scripts/inference_rgbd.py` conditions the
+model on them (task config `configs/model/task/rgbd.yaml`, which enables the depth and ray-direction
+encoders) and uses the depth validity mask instead of the MoGe non-ambiguous mask. Depth maps are
+expected to be single-channel images where `0` marks invalid pixels; use `--depth_scale` to convert
+stored values to meters (`0.001` for millimeter `uint16` PNGs).
+
+```bash
+python scripts/inference_rgbd.py \
+    --rgb_dir /path/to/rgb \
+    --depth_dir /path/to/depth \
+    --camera_params /path/to/rgb_camera_param.yaml \
+    --checkpoint_path checkpoints/any4d_4v_combined.pth \
+    --output_dir outputs/rgbd_run \
+    --save_ply
+```
+
+RGB and depth files are paired by file stem (a trailing `_rgb`/`_depth` suffix and a leading
+`color_`/`depth_` prefix are ignored). Use `--start_idx`, `--end_idx`, `--stride` and `--chunk_size`
+to select and batch the input views, `--task images_only` for RGB-only inference, or
+`--no_amp` to disable bfloat16 autocast. Predictions (pointmaps, depth, poses, input depth, validity
+masks) are written per view as compressed `.npz` files together with a `summary.json` that reports
+the agreement between predicted and input depth.
 
 
 ## Interactive Demos

@@ -2,6 +2,8 @@
 checkpoints/
 local/
 reference_data/
+outputs/
+.pixi/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

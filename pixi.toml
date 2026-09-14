@@ -1,0 +1,28 @@
+[workspace]
+name = "any4d"
+version = "1.0.0"
+description = "Unified Feed-Forward Metric 4D Reconstruction"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+pip = ">=24"
+git = ">=2.40"
+ruff = ">=0.9"
+
+[pypi-dependencies]
+# Editable install of this repository (pulls the dependencies declared in pyproject.toml)
+any4d = { path = ".", editable = true }
+# CUDA 12.8 wheels: required for Blackwell GPUs (e.g. RTX 50 series / sm_120)
+torch = { version = "==2.8.0", index = "https://download.pytorch.org/whl/cu128" }
+torchvision = { version = "==0.23.0", index = "https://download.pytorch.org/whl/cu128" }
+torchaudio = { version = "==2.8.0", index = "https://download.pytorch.org/whl/cu128" }
+
+[tasks]
+# Download the official pretrained checkpoint into checkpoints/
+download-checkpoint = "python scripts/download_checkpoint.py"
+# RGB-D inference with the official pretrained checkpoint (see --help for arguments)
+infer-rgbd = "python scripts/inference_rgbd.py"
+# Quick GPU sanity check
+gpu-check = "python -c \"import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')\""
